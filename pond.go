@@ -55,15 +55,31 @@ func PanicHandler(panicHandler func(interface{})) Option {
 	}
 }
 
+// RetryFailedTaskCount allows to set max retry count for a failed task
+func RetryFailedTaskCount(count uint64) Option {
+	return func(pool *WorkerPool) {
+		pool.maxRetryCount = count
+	}
+}
+
+// RetryFailedTaskCount allows to set max retry count for a failed task
+func RetryFailedTaskInterval(interval time.Duration) Option {
+	return func(pool *WorkerPool) {
+		pool.retryInterval = interval
+	}
+}
+
 // WorkerPool models a pool of workers
 type WorkerPool struct {
 	// Configurable settings
-	maxWorkers   int
-	maxCapacity  int
-	minWorkers   int
-	idleTimeout  time.Duration
-	strategy     ResizingStrategy
-	panicHandler func(interface{})
+	maxWorkers    int
+	maxCapacity   int
+	minWorkers    int
+	idleTimeout   time.Duration
+	strategy      ResizingStrategy
+	panicHandler  func(interface{})
+	maxRetryCount uint64
+	retryInterval time.Duration
 	// Atomic counters
 	workerCount         int32
 	idleWorkerCount     int32
@@ -87,11 +103,12 @@ func New(maxWorkers, maxCapacity int, options ...Option) *WorkerPool {
 
 	// Instantiate the pool
 	pool := &WorkerPool{
-		maxWorkers:   maxWorkers,
-		maxCapacity:  maxCapacity,
-		idleTimeout:  defaultIdleTimeout,
-		strategy:     Eager(),
-		panicHandler: defaultPanicHandler,
+		maxWorkers:    maxWorkers,
+		maxCapacity:   maxCapacity,
+		idleTimeout:   defaultIdleTimeout,
+		strategy:      Eager(),
+		panicHandler:  defaultPanicHandler,
+		retryInterval: time.Second,
 	}
 
 	// Apply all options
@@ -368,10 +385,34 @@ func (p *WorkerPool) executeTask(task func()) {
 	// Decrement waiting task count
 	atomic.AddUint64(&p.waitingTaskCount, ^uint64(0))
 
-	task()
+	p.executeTaskWithRetry(task)
 
 	// Increment successful task count
 	atomic.AddUint64(&p.successfulTaskCount, 1)
+}
+
+func (p *WorkerPool) executeTaskWithRetry(task func()) {
+	interval := p.retryInterval
+	for i := 0; i < int(p.maxRetryCount)+1; i++ {
+		if r := p.executeTaskWithRecovery(task, p.maxRetryCount > 0 && i < int(p.maxRetryCount)); r != nil {
+			time.Sleep(interval)
+			continue
+		}
+		break
+	}
+}
+
+func (p *WorkerPool) executeTaskWithRecovery(task func(), withRecover bool) (r interface{}) {
+	if withRecover {
+		defer func() {
+			if r = recover(); r != nil {
+				// Invoke panic handler
+				p.panicHandler(r)
+			}
+		}()
+	}
+	task()
+	return
 }
 
 func (p *WorkerPool) incrementWorkerCount() bool {
